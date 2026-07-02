@@ -1,0 +1,14 @@
+{
+  "id": "mcp-bridge",
+  "name": "MCP 工具桥",
+  "version": "1.0.0",
+  "description": "为 Roche 接入 MCP 服务器，支持手动调用工具和 AI 自主调用两种模式",
+  "author": "your-github-username",
+  "entry": "https://raw.githubusercontent.com/laliandyunhe/MCP/main/plugin.js",
+  "hash": "",
+  "permissions": [
+    "ui",
+    "storage",
+    "ai:chat"
+  ]
+}
