@@ -806,6 +806,12 @@
       body.appendChild(input);
     });
 
+    // 预览结果区域 (新增)
+    var previewBox = document.createElement("div");
+    previewBox.className = "mcp-tool-preview-box";
+    previewBox.style.cssText = "display:none; margin-top:12px; padding:12px; background:#f0f2f5; border-radius:8px; font-size:13px; color:#333; max-height:250px; overflow-y:auto; word-break:break-all; white-space:pre-wrap; border:1px solid #e8e8ed;";
+    body.appendChild(previewBox);
+
     // 调用按钮
     var callBtn = document.createElement("button");
     callBtn.className = "mcp-call-btn";
@@ -813,6 +819,7 @@
     callBtn.onclick = async function () {
       callBtn.disabled = true;
       callBtn.innerHTML = I.spin + " 调用中…";
+      previewBox.style.display = "none"; // 隐藏上次的预览
 
       // 收集参数
       var args = {};
@@ -840,13 +847,28 @@
 
       try {
         var result = await server.callTool(tool.name, args);
+        
+        // 渲染预览结果 (新增)
+        previewBox.style.display = "block";
+        var resText = "";
+        if (result && result.content && Array.isArray(result.content)) {
+          resText = result.content.map(function(c){ return c.text || JSON.stringify(c); }).join("\n");
+        } else {
+          resText = typeof result === "object" ? JSON.stringify(result, null, 2) : String(result || "（无返回内容）");
+        }
+        previewBox.innerHTML = "<strong style='color:#34c759;'>✓ 预览获取的内容：</strong>\n\n" + resText;
+
         injectToolResult(server.name, tool.name, args, result, false);
         callBtn.textContent = "✓ 调用成功";
         setTimeout(function () {
           callBtn.disabled = false;
-          callBtn.textContent = "调用工具";
+          callBtn.textContent = "再次调用";
         }, 2000);
       } catch (e) {
+        // 错误预览
+        previewBox.style.display = "block";
+        previewBox.innerHTML = "<strong style='color:#ff3b30;'>✗ 调用失败：</strong>\n\n" + e.message;
+
         injectToolResult(server.name, tool.name, args, e.message, true);
         callBtn.disabled = false;
         callBtn.textContent = "调用工具";
@@ -1596,13 +1618,17 @@
      ============================================================ */
   var _autoObserver = null;
 
+  /* ============================================================
+     AI 自主模式：拦截发送并注入工具上下文
+     ============================================================ */
   function startAutoMode() {
-    // 监听发送按钮点击，在消息发出前准备工具描述
-    if (_autoObserver) return;
+    if (!state.roche || !state.roche.ai || !state.roche.ai.chat) return;
 
-    // 方案：给 roche.ai.chat 包一层代理
-    if (!state.roche || !state.roche.ai) return;
-    var origChat = state.roche.ai.chat.bind(state.roche.ai);
+    // 修复 Bug：防止代理重绑定导致的死循环，把原本的 chat 保存到 __mcpOrigChat
+    if (!state.roche.ai.__mcpOrigChat) {
+      state.roche.ai.__mcpOrigChat = state.roche.ai.chat.bind(state.roche.ai);
+    }
+    var origChat = state.roche.ai.__mcpOrigChat;
 
     state.roche.ai.chat = async function (opts) {
       if (state.mode !== "auto") return origChat(opts);
@@ -1618,7 +1644,6 @@
             return c.id === s.id;
           });
           var disabled = (sCfg && sCfg.disabledTools) || [];
-          // 临时过滤掉禁用工具的描述
           var origTools = s.tools;
           s.tools = origTools.filter(function (t) {
             return disabled.indexOf(t.name) === -1;
@@ -1632,17 +1657,21 @@
         .filter(Boolean)
         .join("\n\n");
 
+      if (!toolsDesc) return origChat(opts);
+
+      // 修复 Bug：优化工具提示词，强制AI使用标准 Markdown JSON 输出，提高识别成功率
       var toolSystemPrompt = [
-        "你可以调用以下 MCP 工具来辅助回答（如果需要）：",
+        "【系统指令：MCP 工具调用】",
+        "你有权限调用以下 MCP 工具来辅助回答问题（按需调用）：",
         toolsDesc,
         "",
-        "如需调用工具，请在回复的最开始输出以下 JSON（必须在 <tool_call> 标签内），否则直接回答：",
-        "<tool_call>",
-        '{"server":"服务器名称","tool":"工具名称","args":{"参数名":"参数值"}}',
-        "</tool_call>",
+        "如果你需要调用工具，你必须且只能输出一个 JSON 代码块，格式如下（注意一定要带 mcp_call）：",
+        "```json",
+        '{"mcp_call": {"server": "服务器名", "tool": "工具名", "args": {"参数1": "值1"}}}',
+        "```",
+        "如果你不需要调用工具，请直接正常回答用户的问题，不要输出 JSON 块。"
       ].join("\n");
 
-      // 在 messages 的第一个 system 消息中追加工具描述，或插入新的 system 消息
       var messages = (opts.messages || []).slice();
       var hasSystem = messages.length && messages[0].role === "system";
       if (hasSystem) {
@@ -1653,36 +1682,43 @@
         messages.unshift({ role: "system", content: toolSystemPrompt });
       }
 
+      // 首轮请求：发给 AI 判断是否需要调用工具（禁用流式以便解析）
       var firstResp = await origChat(
-        Object.assign({}, opts, { messages: messages, stream: false }),
+        Object.assign({}, opts, { messages: messages, stream: false })
       );
-      var respText =
-        typeof firstResp === "string"
+      
+      var respText = typeof firstResp === "string"
           ? firstResp
-          : (firstResp && firstResp.text) || "";
+          : (firstResp && firstResp.text) || (firstResp && firstResp.content) || "";
 
-      // 解析 <tool_call>
-      var toolCallMatch = respText.match(/<tool_call>([\s\S]*?)<\/tool_call>/);
-      if (!toolCallMatch) return firstResp; // 没有工具调用，直接返回
+      // 修复 Bug：增加对 JSON 块的强力捕获，兼容多种 AI 模型的输出习惯
+      var callSpec = null;
+      var jsonMatch = respText.match(/```json\s*(\{[\s\S]*?\})\s*```/);
+      if (jsonMatch) {
+        try {
+          var parsed = JSON.parse(jsonMatch[1].trim());
+          if (parsed.mcp_call) callSpec = parsed.mcp_call;
+        } catch(e) {}
+      }
+      if (!callSpec) {
+        // 兼容原有的 <tool_call> 标签防错
+        var tcMatch = respText.match(/<tool_call>([\s\S]*?)<\/tool_call>/);
+        if (tcMatch) {
+          try { callSpec = JSON.parse(tcMatch[1].trim()); } catch(e) {}
+        }
+      }
 
-      var callSpec;
-      try {
-        callSpec = JSON.parse(toolCallMatch[1].trim());
-      } catch (e) {
+      // 如果未发现合法的工具调用，直接原样返回
+      if (!callSpec || !callSpec.server || !callSpec.tool) {
         return firstResp;
       }
 
       var targetServer = state.servers.find(function (s) {
-        return (
-          s.initialized &&
-          (s.name === callSpec.server || callSpec.server === undefined)
-        );
+        return s.initialized && (s.name === callSpec.server);
       });
-      var targetTool =
-        targetServer &&
-        targetServer.tools.find(function (t) {
-          return t.name === callSpec.tool;
-        });
+      var targetTool = targetServer && targetServer.tools.find(function (t) {
+        return t.name === callSpec.tool;
+      });
 
       if (!targetServer || !targetTool) return firstResp;
 
@@ -1691,14 +1727,14 @@
       try {
         toolResult = await targetServer.callTool(
           callSpec.tool,
-          callSpec.args || {},
+          callSpec.args || {}
         );
         injectToolResult(
           targetServer.name,
           callSpec.tool,
           callSpec.args,
           toolResult,
-          false,
+          false
         );
       } catch (e) {
         toolError = e.message;
@@ -1707,41 +1743,34 @@
           callSpec.tool,
           callSpec.args,
           e.message,
-          true,
+          true
         );
       }
 
-      if (toolError) return firstResp;
-
-      // 把工具结果喂回 AI，发起第二轮
-      var toolResultText = (function () {
+      // 将工具结果处理后传回给 AI
+      var toolResultText = "";
+      if (toolError) {
+        toolResultText = "调用失败：" + toolError;
+      } else {
         var content = toolResult && toolResult.content;
-        if (Array.isArray(content))
-          return content
-            .map(function (c) {
-              return c.text || JSON.stringify(c);
-            })
-            .join("\n");
-        return typeof toolResult === "object"
-          ? JSON.stringify(toolResult, null, 2)
-          : String(toolResult || "");
-      })();
+        if (Array.isArray(content)) {
+          toolResultText = content.map(function(c) { return c.text || JSON.stringify(c); }).join("\n");
+        } else {
+          toolResultText = typeof toolResult === "object" ? JSON.stringify(toolResult, null, 2) : String(toolResult || "");
+        }
+      }
 
       var round2Messages = messages.concat([
         { role: "assistant", content: respText },
         {
           role: "user",
-          content:
-            "工具 [" +
-            callSpec.tool +
-            "] 返回结果：\n" +
-            toolResultText +
-            "\n\n请基于以上结果回答用户的问题。",
-        },
+          content: "调用工具 [" + callSpec.tool + "] 成功，返回结果如下：\n```\n" + toolResultText + "\n```\n请基于以上结果继续回答用户的问题。"
+        }
       ]);
 
+      // 二轮对话：携带原本的设置（比如原先的 stream=true）发出请求
       return await origChat(
-        Object.assign({}, opts, { messages: round2Messages }),
+        Object.assign({}, opts, { messages: round2Messages })
       );
     };
   }
