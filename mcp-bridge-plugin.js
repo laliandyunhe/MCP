@@ -1276,50 +1276,18 @@
     headersSection.appendChild(addHeaderBtn);
     basicScroll.appendChild(headersSection);
 
-    /* 底部操作按钮区域 */
+    /* 底部保存按钮（备用，截图里右上角也有）*/
     var saveSection = document.createElement("div");
     saveSection.className = "mcp-section";
-    saveSection.style.cssText =
-      "display:flex; flex-direction:column; gap:12px; margin-top:10px;";
-
     var saveBtn = document.createElement("button");
     saveBtn.className = "mcp-add-big-btn";
     saveBtn.style.background = "#34c759";
-    saveBtn.innerHTML = "保存配置";
+    saveBtn.innerHTML = "保存";
     saveBtn.onclick = doSave;
     saveSection.appendChild(saveBtn);
-
-    // 如果是编辑已有服务器，增加删除按钮
-    if (cfg.id) {
-      var delBtn = document.createElement("button");
-      delBtn.className = "mcp-add-big-btn";
-      delBtn.style.background = "#ff3b30";
-      delBtn.innerHTML = I.trash + " 删除服务器";
-      delBtn.onclick = function () {
-        if (!confirm("确定删除「" + cfg.name + "」？")) return;
-        var existConn = state.servers.find(function (s) {
-          return s.id === cfg.id;
-        });
-        if (existConn) {
-          existConn.disconnect();
-          state.servers = state.servers.filter(function (s) {
-            return s.id !== cfg.id;
-          });
-        }
-        state.configs = state.configs.filter(function (c) {
-          return c.id !== cfg.id;
-        });
-        delete state.errors[cfg.id];
-        saveConfig(state.roche);
-        state.editingServer = undefined;
-        state._formTab = undefined;
-        state.view = "settings";
-        render();
-      };
-      saveSection.appendChild(delBtn);
-    }
-
     basicScroll.appendChild(saveSection);
+
+    root.appendChild(basicScroll);
 
     /* ══════════════════════════════
        工具 Tab（每个工具有启用/禁用开关，底部保存）
