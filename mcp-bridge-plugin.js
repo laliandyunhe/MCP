@@ -809,7 +809,8 @@
     // 预览结果区域 (新增)
     var previewBox = document.createElement("div");
     previewBox.className = "mcp-tool-preview-box";
-    previewBox.style.cssText = "display:none; margin-top:12px; padding:12px; background:#f0f2f5; border-radius:8px; font-size:13px; color:#333; max-height:250px; overflow-y:auto; word-break:break-all; white-space:pre-wrap; border:1px solid #e8e8ed;";
+    previewBox.style.cssText =
+      "display:none; margin-top:12px; padding:12px; background:#f0f2f5; border-radius:8px; font-size:13px; color:#333; max-height:250px; overflow-y:auto; word-break:break-all; white-space:pre-wrap; border:1px solid #e8e8ed;";
     body.appendChild(previewBox);
 
     // 调用按钮
@@ -847,16 +848,25 @@
 
       try {
         var result = await server.callTool(tool.name, args);
-        
+
         // 渲染预览结果 (新增)
         previewBox.style.display = "block";
         var resText = "";
         if (result && result.content && Array.isArray(result.content)) {
-          resText = result.content.map(function(c){ return c.text || JSON.stringify(c); }).join("\n");
+          resText = result.content
+            .map(function (c) {
+              return c.text || JSON.stringify(c);
+            })
+            .join("\n");
         } else {
-          resText = typeof result === "object" ? JSON.stringify(result, null, 2) : String(result || "（无返回内容）");
+          resText =
+            typeof result === "object"
+              ? JSON.stringify(result, null, 2)
+              : String(result || "（无返回内容）");
         }
-        previewBox.innerHTML = "<strong style='color:#34c759;'>✓ 预览获取的内容：</strong>\n\n" + resText;
+        previewBox.innerHTML =
+          "<strong style='color:#34c759;'>✓ 预览获取的内容：</strong>\n\n" +
+          resText;
 
         injectToolResult(server.name, tool.name, args, result, false);
         callBtn.textContent = "✓ 调用成功";
@@ -867,7 +877,9 @@
       } catch (e) {
         // 错误预览
         previewBox.style.display = "block";
-        previewBox.innerHTML = "<strong style='color:#ff3b30;'>✗ 调用失败：</strong>\n\n" + e.message;
+        previewBox.innerHTML =
+          "<strong style='color:#ff3b30;'>✗ 调用失败：</strong>\n\n" +
+          e.message;
 
         injectToolResult(server.name, tool.name, args, e.message, true);
         callBtn.disabled = false;
@@ -1619,165 +1631,176 @@
   var _autoObserver = null;
 
   /* ============================================================
-     AI 自主模式：拦截发送并注入工具上下文
+     AI 自主模式：无损拦截流、后台静默调用、自动接续对话
      ============================================================ */
+  
+  // 处理非流式返回的情况（备用）
+  async function handleNonStream(resp, opts) {
+    var fullText = typeof resp === "string" ? resp : (resp.text || resp.content || "");
+    var callSpec = extractToolCall(fullText);
+    
+    if (callSpec && callSpec.server && callSpec.tool) {
+      var targetServer = state.servers.find(function(s) { return s.initialized && s.name === callSpec.server; });
+      if (targetServer) {
+        var toolResultText = "";
+        try {
+          var res = await targetServer.callTool(callSpec.tool, callSpec.args || {});
+          var content = res && res.content;
+          toolResultText = Array.isArray(content) ? content.map(function(c) { return c.text || JSON.stringify(c); }).join("\n") : (typeof res === 'object' ? JSON.stringify(res, null, 2) : String(res));
+        } catch (e) {
+          toolResultText = "Error: " + e.message;
+        }
+        var r2Messages = opts.messages.concat([
+          { role: "assistant", content: fullText },
+          { role: "user", content: "工具调用完成。结果：\n```\n" + toolResultText + "\n```\n请基于此结果继续回答。" }
+        ]);
+        var r2Opts = Object.assign({}, opts, { messages: r2Messages });
+        return await state.roche.ai.__mcpOrigChat.call(state.roche.ai, r2Opts);
+      }
+    }
+    return resp;
+  }
+
+  // 提取 JSON 工具调用参数
+  function extractToolCall(text) {
+    var jsonMatch = text.match(/```json\s*(\{[\s\S]*?\})\s*```/);
+    if (!jsonMatch) {
+      var m = text.match(/\{[\s\S]*"mcp_call"[\s\S]*\}/); // 兼容没有 markdown 格式的情况
+      if (m) jsonMatch = [m[0], m[0]];
+    }
+    if (jsonMatch) {
+      try {
+        var parsed = JSON.parse(jsonMatch[1].trim());
+        if (parsed.mcp_call) return parsed.mcp_call;
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  // 代理生成器：处理流式输出，拦截结果并自动开启二轮对话
+  async function* wrapStream(origStream, opts) {
+    var fullText = "";
+    var isStringStream = false;
+
+    // 第一轮：把 AI 决定调用工具的 JSON 流式传递给 UI，让用户看到思考过程
+    for await (const chunk of origStream) {
+      if (typeof chunk === "string") {
+        fullText += chunk;
+        isStringStream = true;
+      } else if (chunk && chunk.text) {
+        fullText += chunk.text;
+      } else if (chunk && chunk.content) {
+        fullText += chunk.content;
+      } else if (chunk && chunk.choices && chunk.choices[0].delta && chunk.choices[0].delta.content) {
+        fullText += chunk.choices[0].delta.content; // 兼容 OpenAI 格式
+      }
+      yield chunk;
+    }
+
+    var callSpec = extractToolCall(fullText);
+
+    // 检测到工具调用，触发后台隐藏执行
+    if (callSpec && callSpec.server && callSpec.tool) {
+      var targetServer = state.servers.find(function(s) { return s.initialized && s.name === callSpec.server; });
+      if (targetServer) {
+        // 在前端聊天界面打印等待提示
+        var msg = "\n\n> ⚙️ [MCP后台] 正在调取数据: " + callSpec.tool + "...\n\n";
+        yield isStringStream ? msg : { text: msg, content: msg };
+
+        var toolResultText = "";
+        try {
+          var res = await targetServer.callTool(callSpec.tool, callSpec.args || {});
+          var content = res && res.content;
+          if (Array.isArray(content)) {
+            toolResultText = content.map(function(c) { return c.text || JSON.stringify(c); }).join("\n");
+          } else {
+            toolResultText = typeof res === "object" ? JSON.stringify(res, null, 2) : String(res);
+          }
+        } catch (e) {
+          toolResultText = "调用异常: " + e.message;
+        }
+
+        // 构建第二轮请求的上下文（携带工具返回的真实数据）
+        var r2Messages = opts.messages.concat([
+          { role: "assistant", content: fullText },
+          { role: "user", content: "工具调取完成，请根据以下数据为我解答：\n```\n" + toolResultText + "\n```" }
+        ]);
+
+        var r2Opts = Object.assign({}, opts, { messages: r2Messages });
+        var r2Stream = await state.roche.ai.__mcpOrigChat.call(state.roche.ai, r2Opts);
+
+        // 将第二轮（AI 基于数据的最终回答）直接拼接到当前流中输出给用户
+        if (r2Stream && typeof r2Stream[Symbol.asyncIterator] === "function") {
+          for await (const r2chunk of r2Stream) {
+            yield r2chunk;
+          }
+        } else {
+          var txt = typeof r2Stream === "string" ? r2Stream : (r2Stream.text || r2Stream.content || JSON.stringify(r2Stream));
+          yield isStringStream ? txt : { text: txt, content: txt };
+        }
+      }
+    }
+  }
+
   function startAutoMode() {
     if (!state.roche || !state.roche.ai || !state.roche.ai.chat) return;
 
-    // 修复 Bug：防止代理重绑定导致的死循环，把原本的 chat 保存到 __mcpOrigChat
+    // 确保只拦截绑定一次
     if (!state.roche.ai.__mcpOrigChat) {
-      state.roche.ai.__mcpOrigChat = state.roche.ai.chat.bind(state.roche.ai);
+      state.roche.ai.__mcpOrigChat = state.roche.ai.chat;
     }
     var origChat = state.roche.ai.__mcpOrigChat;
 
     state.roche.ai.chat = async function (opts) {
-      if (state.mode !== "auto") return origChat(opts);
+      if (state.mode !== "auto") return await origChat.call(this, opts);
 
-      var connectedServers = state.servers.filter(function (s) {
-        return s.initialized && s.tools.length;
-      });
-      if (!connectedServers.length) return origChat(opts);
+      var connectedServers = state.servers.filter(function(s) { return s.initialized && s.tools.length; });
+      if (!connectedServers.length) return await origChat.call(this, opts);
 
-      var toolsDesc = connectedServers
-        .map(function (s) {
-          var sCfg = state.configs.find(function (c) {
-            return c.id === s.id;
-          });
-          var disabled = (sCfg && sCfg.disabledTools) || [];
-          var origTools = s.tools;
-          s.tools = origTools.filter(function (t) {
-            return disabled.indexOf(t.name) === -1;
-          });
-          var desc = s.tools.length
-            ? "【" + s.name + "】\n" + s.describeTools()
-            : "";
-          s.tools = origTools; // 还原
-          return desc;
-        })
-        .filter(Boolean)
-        .join("\n\n");
+      var toolsDesc = connectedServers.map(function (s) {
+        var sCfg = state.configs.find(function(c) { return c.id === s.id; });
+        var disabled = (sCfg && sCfg.disabledTools) || [];
+        var origTools = s.tools;
+        s.tools = origTools.filter(function(t) { return disabled.indexOf(t.name) === -1; });
+        var desc = s.tools.length ? "【" + s.name + "】\n" + s.describeTools() : "";
+        s.tools = origTools; 
+        return desc;
+      }).filter(Boolean).join("\n\n");
 
-      if (!toolsDesc) return origChat(opts);
+      if (!toolsDesc) return await origChat.call(this, opts);
 
-      // 修复 Bug：优化工具提示词，强制AI使用标准 Markdown JSON 输出，提高识别成功率
       var toolSystemPrompt = [
-        "【系统指令：MCP 工具调用】",
-        "你有权限调用以下 MCP 工具来辅助回答问题（按需调用）：",
+        "【系统指令：MCP 外部工具】",
+        "你可以自主判断是否需要调用以下工具来辅助回答：",
         toolsDesc,
-        "",
-        "如果你需要调用工具，你必须且只能输出一个 JSON 代码块，格式如下（注意一定要带 mcp_call）：",
+        "若需调用工具，请且仅输出一个 JSON 代码块，格式严格如下：",
         "```json",
         '{"mcp_call": {"server": "服务器名", "tool": "工具名", "args": {"参数1": "值1"}}}',
         "```",
-        "如果你不需要调用工具，请直接正常回答用户的问题，不要输出 JSON 块。"
+        "如果可以直接回答，请正常回复，无需输出 JSON。"
       ].join("\n");
 
       var messages = (opts.messages || []).slice();
-      var hasSystem = messages.length && messages[0].role === "system";
-      if (hasSystem) {
-        messages[0] = Object.assign({}, messages[0], {
-          content: messages[0].content + "\n\n" + toolSystemPrompt,
-        });
+      if (messages.length && messages[0].role === "system") {
+        messages[0] = Object.assign({}, messages[0], { content: messages[0].content + "\n\n" + toolSystemPrompt });
       } else {
         messages.unshift({ role: "system", content: toolSystemPrompt });
       }
 
-      // 首轮请求：发给 AI 判断是否需要调用工具（禁用流式以便解析）
-      var firstResp = await origChat(
-        Object.assign({}, opts, { messages: messages, stream: false })
-      );
-      
-      var respText = typeof firstResp === "string"
-          ? firstResp
-          : (firstResp && firstResp.text) || (firstResp && firstResp.content) || "";
+      var newOpts = Object.assign({}, opts, { messages: messages });
+      var resp = await origChat.call(this, newOpts);
 
-      // 修复 Bug：增加对 JSON 块的强力捕获，兼容多种 AI 模型的输出习惯
-      var callSpec = null;
-      var jsonMatch = respText.match(/```json\s*(\{[\s\S]*?\})\s*```/);
-      if (jsonMatch) {
-        try {
-          var parsed = JSON.parse(jsonMatch[1].trim());
-          if (parsed.mcp_call) callSpec = parsed.mcp_call;
-        } catch(e) {}
-      }
-      if (!callSpec) {
-        // 兼容原有的 <tool_call> 标签防错
-        var tcMatch = respText.match(/<tool_call>([\s\S]*?)<\/tool_call>/);
-        if (tcMatch) {
-          try { callSpec = JSON.parse(tcMatch[1].trim()); } catch(e) {}
-        }
-      }
-
-      // 如果未发现合法的工具调用，直接原样返回
-      if (!callSpec || !callSpec.server || !callSpec.tool) {
-        return firstResp;
-      }
-
-      var targetServer = state.servers.find(function (s) {
-        return s.initialized && (s.name === callSpec.server);
-      });
-      var targetTool = targetServer && targetServer.tools.find(function (t) {
-        return t.name === callSpec.tool;
-      });
-
-      if (!targetServer || !targetTool) return firstResp;
-
-      // 执行工具
-      var toolResult, toolError;
-      try {
-        toolResult = await targetServer.callTool(
-          callSpec.tool,
-          callSpec.args || {}
-        );
-        injectToolResult(
-          targetServer.name,
-          callSpec.tool,
-          callSpec.args,
-          toolResult,
-          false
-        );
-      } catch (e) {
-        toolError = e.message;
-        injectToolResult(
-          targetServer.name,
-          callSpec.tool,
-          callSpec.args,
-          e.message,
-          true
-        );
-      }
-
-      // 将工具结果处理后传回给 AI
-      var toolResultText = "";
-      if (toolError) {
-        toolResultText = "调用失败：" + toolError;
+      // 判断返回的是流还是静态文本，保证原有 UI 逻辑不崩溃
+      if (resp && typeof resp[Symbol.asyncIterator] === "function") {
+        return wrapStream(resp, newOpts);
       } else {
-        var content = toolResult && toolResult.content;
-        if (Array.isArray(content)) {
-          toolResultText = content.map(function(c) { return c.text || JSON.stringify(c); }).join("\n");
-        } else {
-          toolResultText = typeof toolResult === "object" ? JSON.stringify(toolResult, null, 2) : String(toolResult || "");
-        }
+        return await handleNonStream(resp, newOpts);
       }
-
-      var round2Messages = messages.concat([
-        { role: "assistant", content: respText },
-        {
-          role: "user",
-          content: "调用工具 [" + callSpec.tool + "] 成功，返回结果如下：\n```\n" + toolResultText + "\n```\n请基于以上结果继续回答用户的问题。"
-        }
-      ]);
-
-      // 二轮对话：携带原本的设置（比如原先的 stream=true）发出请求
-      return await origChat(
-        Object.assign({}, opts, { messages: round2Messages })
-      );
     };
   }
 
   function stopAutoMode() {
-    // 恢复原 chat 函数（如果有备份）
-    // 这里简单处理：unmount 后整个 state 清空，下次 mount 重新代理
+    // 保持为空，因为就算 UI 关闭，我们仍希望代理函数一直在后台拦截工作
   }
 
   /* ============================================================
@@ -1806,7 +1829,7 @@
   }
 
   /* ============================================================
-     插件注册
+     插件注册与后台常驻管理
      ============================================================ */
   window.RochePlugin.register({
     id: "mcp-bridge",
@@ -1832,31 +1855,31 @@
           document.head.appendChild(styleEl);
           state.styleEl = styleEl;
 
-          // 使用异步回调确保数据加载完成后再连接和渲染
-          loadConfig(roche, function () {
-            // 自动连接上次已配置并启用的服务器，避免重复连接
-            state.configs.forEach(function (cfg) {
-              var existing = state.servers.find(function (s) {
-                return s.id === cfg.id;
+          // 防止开关页面导致的重复连接和事件绑定
+          if (!state._initialized) {
+            state._initialized = true;
+            loadConfig(roche, function () {
+              // 自动连接上次已配置并启用的服务器
+              state.configs.forEach(function (cfg) {
+                var existing = state.servers.find(function(s){ return s.id === cfg.id; });
+                if (cfg.enabled !== false && !existing) {
+                  connectServer(cfg);
+                }
               });
-              if (cfg.enabled !== false && !existing) {
-                connectServer(cfg);
-              }
+              // 启动后台自主监控代理（持久驻留）
+              startAutoMode();
+              render();
             });
-            // 启动自主模式代理
-            startAutoMode();
+          } else {
+            // 如果已经在后台运行，直接渲染即可
             render();
-          });
+          }
         },
         unmount: function (container) {
-          // 【注意】移除断开服务器连接的代码，让 MCP 服务器在后台保持常驻，以供 AI 调用
-
-          // 移除样式
+          // 只清理 UI 的 DOM，绝对不清理状态和监听器，保障后台继续运行
           if (state.styleEl && state.styleEl.parentNode) {
             state.styleEl.parentNode.removeChild(state.styleEl);
           }
-
-          // 不断开 _autoObserver 的绑定，因为后台聊天仍然需要使用它
           if (container) container.innerHTML = "";
         },
       },
