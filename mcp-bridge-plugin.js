@@ -1630,29 +1630,40 @@
      ============================================================ */
   var _autoObserver = null;
 
-  /* ============================================================
-     AI 自主模式：无损拦截流、后台静默调用、自动接续对话
-     ============================================================ */
-  
-  // 处理非流式返回的情况（备用）
+  // 处理非流式返回的情况
   async function handleNonStream(resp, opts) {
-    var fullText = typeof resp === "string" ? resp : (resp.text || resp.content || "");
+    var fullText = typeof resp === "string" ? resp : resp.text || resp.content || "";
     var callSpec = extractToolCall(fullText);
-    
+
     if (callSpec && callSpec.server && callSpec.tool) {
-      var targetServer = state.servers.find(function(s) { return s.initialized && s.name === callSpec.server; });
+      var targetServer = state.servers.find(function (s) {
+        return s.initialized && s.name === callSpec.server;
+      });
       if (targetServer) {
         var toolResultText = "";
+        var rawResult = null;
+        var isError = false;
         try {
-          var res = await targetServer.callTool(callSpec.tool, callSpec.args || {});
-          var content = res && res.content;
-          toolResultText = Array.isArray(content) ? content.map(function(c) { return c.text || JSON.stringify(c); }).join("\n") : (typeof res === 'object' ? JSON.stringify(res, null, 2) : String(res));
+          rawResult = await targetServer.callTool(callSpec.tool, callSpec.args || {});
+          var content = rawResult && rawResult.content;
+          toolResultText = Array.isArray(content)
+            ? content.map(function (c) { return c.text || JSON.stringify(c); }).join("\n")
+            : typeof rawResult === "object" ? JSON.stringify(rawResult, null, 2) : String(rawResult || "（无返回内容）");
         } catch (e) {
+          isError = true;
+          rawResult = e.message;
           toolResultText = "Error: " + e.message;
         }
+
+        // 核心修复：后台自动执行时调用气泡渲染！
+        injectToolResult(targetServer.name, callSpec.tool, callSpec.args, rawResult, isError);
+
         var r2Messages = opts.messages.concat([
           { role: "assistant", content: fullText },
-          { role: "user", content: "工具调用完成。结果：\n```\n" + toolResultText + "\n```\n请基于此结果继续回答。" }
+          {
+            role: "user",
+            content: "工具调取完成，这是返回的数据（请根据此数据为我解答，切勿再次输出 mcp_call 指令）：\n```\n" + toolResultText + "\n```"
+          }
         ]);
         var r2Opts = Object.assign({}, opts, { messages: r2Messages });
         return await state.roche.ai.__mcpOrigChat.call(state.roche.ai, r2Opts);
@@ -1661,19 +1672,110 @@
     return resp;
   }
 
-  // 提取 JSON 工具调用参数
+  // 代理生成器：处理流式输出，拦截结果并自动开启二轮对话
+  async function* wrapStream(origStream, opts) {
+    var fullText = "";
+    var isStringStream = false;
+
+    // 第一轮流传递，收集 AI 思考过程
+    for await (const chunk of origStream) {
+      if (typeof chunk === "string") {
+        fullText += chunk;
+        isStringStream = true;
+      } else if (chunk && chunk.text) {
+        fullText += chunk.text;
+      } else if (chunk && chunk.content) {
+        fullText += chunk.content;
+      } else if (chunk && chunk.choices && chunk.choices[0].delta && chunk.choices[0].delta.content) {
+        fullText += chunk.choices[0].delta.content;
+      }
+      yield chunk;
+    }
+
+    var callSpec = extractToolCall(fullText);
+
+    if (callSpec && callSpec.server && callSpec.tool) {
+      var targetServer = state.servers.find(function (s) {
+        return s.initialized && s.name === callSpec.server;
+      });
+      if (targetServer) {
+        var toolResultText = "";
+        var rawResult = null;
+        var isError = false;
+        try {
+          rawResult = await targetServer.callTool(callSpec.tool, callSpec.args || {});
+          var content = rawResult && rawResult.content;
+          if (Array.isArray(content)) {
+            toolResultText = content.map(function (c) { return c.text || JSON.stringify(c); }).join("\n");
+          } else {
+            toolResultText = typeof rawResult === "object" ? JSON.stringify(rawResult, null, 2) : String(rawResult || "（无返回内容）");
+          }
+        } catch (e) {
+          isError = true;
+          rawResult = e.message;
+          toolResultText = "调用异常: " + e.message;
+        }
+
+        // 核心修复：把结果作为可视化气泡注入聊天界面
+        injectToolResult(targetServer.name, callSpec.tool, callSpec.args, rawResult, isError);
+
+        var r2Messages = opts.messages.concat([
+          { role: "assistant", content: fullText },
+          {
+            role: "user",
+            content: "工具调取完成，这是返回的数据（请根据此数据为我解答，切勿再次输出 mcp_call 指令）：\n```\n" + toolResultText + "\n```",
+          },
+        ]);
+
+        var r2Opts = Object.assign({}, opts, { messages: r2Messages });
+        var r2Stream = await state.roche.ai.__mcpOrigChat.call(state.roche.ai, r2Opts);
+
+        if (r2Stream && typeof r2Stream[Symbol.asyncIterator] === "function") {
+          for await (const r2chunk of r2Stream) {
+            yield r2chunk;
+          }
+        } else {
+          var txt = typeof r2Stream === "string" ? r2Stream : r2Stream.text || r2Stream.content || JSON.stringify(r2Stream);
+          yield isStringStream ? txt : { text: txt, content: txt };
+        }
+      }
+    }
+  }
+
+  // 提取 JSON 工具调用参数 (使用 XML 优先 + 智能容错)
   function extractToolCall(text) {
-    var jsonMatch = text.match(/```json\s*(\{[\s\S]*?\})\s*```/);
+    // 1. 优先匹配稳定的 XML 格式
+    var xmlMatch = text.match(/<mcp_call>([\s\S]*?)<\/mcp_call>/i);
+    if (xmlMatch) {
+      try {
+        var parsed = JSON.parse(xmlMatch[1].trim());
+        if (parsed.server && parsed.tool) return parsed;
+      } catch (e) {}
+    }
+
+    // 2. 兼容 AI 习惯性包裹 Markdown 的情况
+    var jsonMatch = text.match(/```json\s*(\{[\s\S]*?\})\s*```/i);
     if (!jsonMatch) {
-      var m = text.match(/\{[\s\S]*"mcp_call"[\s\S]*\}/); // 兼容没有 markdown 格式的情况
-      if (m) jsonMatch = [m[0], m[0]];
+      jsonMatch = text.match(/```\s*(\{[\s\S]*?\})\s*```/i);
     }
     if (jsonMatch) {
       try {
         var parsed = JSON.parse(jsonMatch[1].trim());
         if (parsed.mcp_call) return parsed.mcp_call;
+        if (parsed.server && parsed.tool) return parsed;
       } catch (e) {}
     }
+
+    // 3. 极其贪婪的兜底（仅提取包裹对象的 JSON，修复原版贪婪全文本崩溃问题）
+    var rawMatch = text.match(/\{[\s\S]*?"server"[\s\S]*?"tool"[\s\S]*?\}/i);
+    if (rawMatch) {
+      try {
+        var parsed = JSON.parse(rawMatch[0].trim());
+        if (parsed.mcp_call) return parsed.mcp_call;
+        if (parsed.server && parsed.tool) return parsed;
+      } catch (e) {}
+    }
+    
     return null;
   }
 
@@ -1691,7 +1793,12 @@
         fullText += chunk.text;
       } else if (chunk && chunk.content) {
         fullText += chunk.content;
-      } else if (chunk && chunk.choices && chunk.choices[0].delta && chunk.choices[0].delta.content) {
+      } else if (
+        chunk &&
+        chunk.choices &&
+        chunk.choices[0].delta &&
+        chunk.choices[0].delta.content
+      ) {
         fullText += chunk.choices[0].delta.content; // 兼容 OpenAI 格式
       }
       yield chunk;
@@ -1701,20 +1808,33 @@
 
     // 检测到工具调用，触发后台隐藏执行
     if (callSpec && callSpec.server && callSpec.tool) {
-      var targetServer = state.servers.find(function(s) { return s.initialized && s.name === callSpec.server; });
+      var targetServer = state.servers.find(function (s) {
+        return s.initialized && s.name === callSpec.server;
+      });
       if (targetServer) {
         // 在前端聊天界面打印等待提示
-        var msg = "\n\n> ⚙️ [MCP后台] 正在调取数据: " + callSpec.tool + "...\n\n";
+        var msg =
+          "\n\n> ⚙️ [MCP后台] 正在调取数据: " + callSpec.tool + "...\n\n";
         yield isStringStream ? msg : { text: msg, content: msg };
 
         var toolResultText = "";
         try {
-          var res = await targetServer.callTool(callSpec.tool, callSpec.args || {});
+          var res = await targetServer.callTool(
+            callSpec.tool,
+            callSpec.args || {},
+          );
           var content = res && res.content;
           if (Array.isArray(content)) {
-            toolResultText = content.map(function(c) { return c.text || JSON.stringify(c); }).join("\n");
+            toolResultText = content
+              .map(function (c) {
+                return c.text || JSON.stringify(c);
+              })
+              .join("\n");
           } else {
-            toolResultText = typeof res === "object" ? JSON.stringify(res, null, 2) : String(res);
+            toolResultText =
+              typeof res === "object"
+                ? JSON.stringify(res, null, 2)
+                : String(res);
           }
         } catch (e) {
           toolResultText = "调用异常: " + e.message;
@@ -1723,11 +1843,20 @@
         // 构建第二轮请求的上下文（携带工具返回的真实数据）
         var r2Messages = opts.messages.concat([
           { role: "assistant", content: fullText },
-          { role: "user", content: "工具调取完成，请根据以下数据为我解答：\n```\n" + toolResultText + "\n```" }
+          {
+            role: "user",
+            content:
+              "工具调取完成，请根据以下数据为我解答：\n```\n" +
+              toolResultText +
+              "\n```",
+          },
         ]);
 
         var r2Opts = Object.assign({}, opts, { messages: r2Messages });
-        var r2Stream = await state.roche.ai.__mcpOrigChat.call(state.roche.ai, r2Opts);
+        var r2Stream = await state.roche.ai.__mcpOrigChat.call(
+          state.roche.ai,
+          r2Opts,
+        );
 
         // 将第二轮（AI 基于数据的最终回答）直接拼接到当前流中输出给用户
         if (r2Stream && typeof r2Stream[Symbol.asyncIterator] === "function") {
@@ -1735,54 +1864,77 @@
             yield r2chunk;
           }
         } else {
-          var txt = typeof r2Stream === "string" ? r2Stream : (r2Stream.text || r2Stream.content || JSON.stringify(r2Stream));
+          var txt =
+            typeof r2Stream === "string"
+              ? r2Stream
+              : r2Stream.text || r2Stream.content || JSON.stringify(r2Stream);
           yield isStringStream ? txt : { text: txt, content: txt };
         }
       }
     }
   }
 
+  /* ============================================================
+     AI 自主模式：无损拦截流、后台静默调用、自动接续对话
+     ============================================================ */
+
   function startAutoMode() {
     if (!state.roche || !state.roche.ai || !state.roche.ai.chat) return;
 
-    // 确保只拦截绑定一次
+    // 核心修复：防止切换页面导致多重套娃代理
+    if (state.roche.ai.chat.isMcpWrapper) return;
+
     if (!state.roche.ai.__mcpOrigChat) {
       state.roche.ai.__mcpOrigChat = state.roche.ai.chat;
     }
     var origChat = state.roche.ai.__mcpOrigChat;
 
-    state.roche.ai.chat = async function (opts) {
+    var wrapper = async function (opts) {
       if (state.mode !== "auto") return await origChat.call(this, opts);
 
-      var connectedServers = state.servers.filter(function(s) { return s.initialized && s.tools.length; });
+      var connectedServers = state.servers.filter(function (s) {
+        return s.initialized && s.tools.length;
+      });
       if (!connectedServers.length) return await origChat.call(this, opts);
 
-      var toolsDesc = connectedServers.map(function (s) {
-        var sCfg = state.configs.find(function(c) { return c.id === s.id; });
-        var disabled = (sCfg && sCfg.disabledTools) || [];
-        var origTools = s.tools;
-        s.tools = origTools.filter(function(t) { return disabled.indexOf(t.name) === -1; });
-        var desc = s.tools.length ? "【" + s.name + "】\n" + s.describeTools() : "";
-        s.tools = origTools; 
-        return desc;
-      }).filter(Boolean).join("\n\n");
+      var toolsDesc = connectedServers
+        .map(function (s) {
+          var sCfg = state.configs.find(function (c) {
+            return c.id === s.id;
+          });
+          var disabled = (sCfg && sCfg.disabledTools) || [];
+          var origTools = s.tools;
+          s.tools = origTools.filter(function (t) {
+            return disabled.indexOf(t.name) === -1;
+          });
+          var desc = s.tools.length
+            ? "【" + s.name + "】\n" + s.describeTools()
+            : "";
+          s.tools = origTools;
+          return desc;
+        })
+        .filter(Boolean)
+        .join("\n\n");
 
       if (!toolsDesc) return await origChat.call(this, opts);
 
+      // 核心修复：强化 Prompt，使用 XML 标签规范模型输出行为，显著提升触发率
       var toolSystemPrompt = [
         "【系统指令：MCP 外部工具】",
-        "你可以自主判断是否需要调用以下工具来辅助回答：",
+        "你可以自主判断是否需要调用以下工具来获取实时信息或执行操作以辅助回答：",
         toolsDesc,
-        "若需调用工具，请且仅输出一个 JSON 代码块，格式严格如下：",
-        "```json",
-        '{"mcp_call": {"server": "服务器名", "tool": "工具名", "args": {"参数1": "值1"}}}',
-        "```",
-        "如果可以直接回答，请正常回复，无需输出 JSON。"
+        "若决定调用工具，请务必且仅输出以下XML标签，在标签内提供JSON格式的参数（一次仅调用一个工具）：",
+        "<mcp_call>",
+        '{"server": "服务器名", "tool": "工具名", "args": {"参数1": "值1"}}',
+        "</mcp_call>",
+        "如果可以直接回答，请正常回复，绝对不要输出 <mcp_call> 标签。"
       ].join("\n");
 
       var messages = (opts.messages || []).slice();
       if (messages.length && messages[0].role === "system") {
-        messages[0] = Object.assign({}, messages[0], { content: messages[0].content + "\n\n" + toolSystemPrompt });
+        messages[0] = Object.assign({}, messages[0], {
+          content: messages[0].content + "\n\n" + toolSystemPrompt,
+        });
       } else {
         messages.unshift({ role: "system", content: toolSystemPrompt });
       }
@@ -1790,13 +1942,16 @@
       var newOpts = Object.assign({}, opts, { messages: messages });
       var resp = await origChat.call(this, newOpts);
 
-      // 判断返回的是流还是静态文本，保证原有 UI 逻辑不崩溃
       if (resp && typeof resp[Symbol.asyncIterator] === "function") {
         return wrapStream(resp, newOpts);
       } else {
         return await handleNonStream(resp, newOpts);
       }
     };
+    
+    // 标记这是我们的 wrapper
+    wrapper.isMcpWrapper = true;
+    state.roche.ai.chat = wrapper;
   }
 
   function stopAutoMode() {
@@ -1861,7 +2016,9 @@
             loadConfig(roche, function () {
               // 自动连接上次已配置并启用的服务器
               state.configs.forEach(function (cfg) {
-                var existing = state.servers.find(function(s){ return s.id === cfg.id; });
+                var existing = state.servers.find(function (s) {
+                  return s.id === cfg.id;
+                });
                 if (cfg.enabled !== false && !existing) {
                   connectServer(cfg);
                 }
@@ -1875,11 +2032,9 @@
             render();
           }
         },
+        // 在 window.RochePlugin.register 的 unmount 中：
         unmount: function (container) {
-          // 只清理 UI 的 DOM，绝对不清理状态和监听器，保障后台继续运行
-          if (state.styleEl && state.styleEl.parentNode) {
-            state.styleEl.parentNode.removeChild(state.styleEl);
-          }
+          // 核心修复：不再移除 styleEl！保留 CSS，防止后台运行时注入到对话里的气泡变成透明乱码
           if (container) container.innerHTML = "";
         },
       },
